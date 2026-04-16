@@ -689,7 +689,32 @@ async def sync_status(supplier: str = "") -> str:
 
 def main():
     """Entry point for the MCP server."""
-    mcp.run(transport="stdio")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Apparel MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="Transport protocol (default: stdio for Claude Desktop, streamable-http for networked/container use)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind when using streamable-http (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind when using streamable-http (default: 8000)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "streamable-http":
+        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

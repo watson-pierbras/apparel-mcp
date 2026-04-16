@@ -18,6 +18,8 @@ Rather than hitting supplier APIs on every query, this server syncs product, pri
 - [Claude Desktop Configuration](#claude-desktop-configuration)
 - [Available MCP Tools](#available-mcp-tools)
 - [Automating Sync with Cron](#automating-sync-with-cron)
+- [GitHub Actions (Automated Sync)](#github-actions-automated-sync)
+- [Running with Podman](#running-with-podman)
 - [Project Structure](#project-structure)
 
 ---
@@ -212,10 +214,16 @@ SanMar sync completed:
 For testing or standalone use:
 
 ```bash
+# stdio mode (default — for Claude Desktop)
 python -m src.server.mcp_server
+
+# streamable-http mode (for networked/container use)
+python -m src.server.mcp_server --transport streamable-http --host 0.0.0.0 --port 8000
 ```
 
-The server uses **stdio transport** (reads JSON-RPC from stdin, writes to stdout). This is the protocol Claude Desktop expects — you don't need to run it manually if Claude Desktop is configured to launch it (see below).
+In stdio mode, the server reads JSON-RPC from stdin and writes to stdout — this is the protocol Claude Desktop expects. You don't need to run it manually if Claude Desktop is configured to launch it (see below).
+
+In streamable-http mode, the server listens on a network port, which is what you want when running inside a container or serving multiple clients.
 
 ---
 
@@ -308,6 +316,138 @@ crontab -e
 
 ---
 
+## GitHub Actions (Automated Sync)
+
+The repo includes a GitHub Actions workflow at `.github/workflows/sync.yml` that runs the sync on a schedule — no server or cron setup required.
+
+### Schedule
+
+| Time (ET) | UTC | Frequency | Sync Type |
+|-----------|-----|-----------|-----------|
+| 5:00 AM | 9:00 | Daily | Full (products + pricing + inventory) |
+| Every 4h | Every 4h | 6x/day | Inventory only |
+| 7:00 AM | 11:00 | Mon, Wed | Incremental (pricing check) |
+
+### Setup
+
+1. Go to your repo's **Settings > Secrets and variables > Actions**
+2. Add these repository secrets:
+
+| Secret | Value |
+|--------|-------|
+| `SANMAR_CUSTOMER_NUMBER` | Your SanMar customer number |
+| `SANMAR_USERNAME` | Your SanMar API username |
+| `SANMAR_PASSWORD` | Your SanMar API password |
+| `SS_ACCOUNT_NUMBER` | Your S&S account number |
+| `SS_API_KEY` | Your S&S API key |
+
+3. The workflow is enabled automatically. You can also trigger it manually from the **Actions** tab with custom supplier/sync type inputs.
+
+### How it works
+
+- The database is persisted as a GitHub Actions artifact between runs (90-day retention), so `price_history` accumulates over time.
+- Each run initializes the schema if the DB doesn't exist, then downloads the previous artifact before syncing.
+- The workflow writes a summary to the GitHub Actions job summary so you can see results at a glance.
+
+### Manual trigger
+
+Go to **Actions > Apparel Data Sync > Run workflow** and choose the supplier and sync type from the dropdowns.
+
+---
+
+## Running with Podman
+
+Running the MCP server in a rootless Podman container is a solid approach for production use. The container uses streamable-http transport so Claude Desktop connects over the network instead of stdio.
+
+### Build the image
+
+```bash
+cd apparel-mcp
+podman build -t apparel-mcp .
+```
+
+### Run the container
+
+```bash
+# Create a named volume for the SQLite database (persists across restarts)
+podman volume create apparel-mcp-data
+
+# Run the server
+podman run -d \
+  --name apparel-mcp \
+  -p 127.0.0.1:8020:8000 \
+  --env-file ~/.config/mcp-env/apparel-mcp.env \
+  -v apparel-mcp-data:/app/data:Z \
+  apparel-mcp
+```
+
+Create the env file at `~/.config/mcp-env/apparel-mcp.env`:
+
+```ini
+SANMAR_CUSTOMER_NUMBER=12345
+SANMAR_USERNAME=your-username
+SANMAR_PASSWORD=your-password
+SS_ACCOUNT_NUMBER=your-account
+SS_API_KEY=your-key
+DB_PATH=/app/data/apparel.db
+```
+
+### Claude Desktop config (container mode)
+
+When running via Podman, Claude Desktop connects over HTTP instead of launching a process:
+
+```json
+{
+  "mcpServers": {
+    "apparel": {
+      "url": "http://127.0.0.1:8020/mcp"
+    }
+  }
+}
+```
+
+### Run sync inside the container
+
+```bash
+# Full sync
+podman exec apparel-mcp python scripts/run_sync.py --supplier sanmar
+
+# Inventory-only
+podman exec apparel-mcp python scripts/run_sync.py --type inventory_only
+```
+
+### Auto-start with systemd (Linux)
+
+A systemd user service file is included at `contrib/apparel-mcp.service`. To install:
+
+```bash
+# Copy the service file
+mkdir -p ~/.config/systemd/user
+cp contrib/apparel-mcp.service ~/.config/systemd/user/
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now apparel-mcp
+
+# Check status
+systemctl --user status apparel-mcp
+
+# View logs
+journalctl --user -u apparel-mcp -f
+```
+
+The server will auto-start on login and restart on failure.
+
+### Why Podman?
+
+- **Rootless** — no daemon, no root access needed
+- **Isolated credentials** — env file stays outside the container image
+- **Persistent data** — named volume survives container rebuilds
+- **Portable** — same Containerfile works with Docker if needed
+- **systemd integration** — auto-start on login, restart on crash, proper logging
+
+---
+
 ## Project Structure
 
 ```
@@ -335,12 +475,21 @@ apparel-mcp/
 │   ├── ssactivewear/              # Phase 2 — REST/JSON client via httpx
 │   │
 │   └── server/
-│       └── mcp_server.py          # FastMCP server — 10 tools, stdio transport
+│       └── mcp_server.py          # FastMCP server — 10 tools, stdio + HTTP transport
 │
 ├── scripts/
 │   ├── setup_db.py                # Initialize database (run once)
 │   ├── add_styles.py              # CLI to add tracked styles
 │   └── run_sync.py                # Manual or cron sync runner
+│
+├── .github/
+│   └── workflows/
+│       └── sync.yml               # GitHub Actions scheduled sync
+│
+├── Containerfile                  # Podman/Docker container build
+├── .containerignore               # Build context exclusions
+├── contrib/
+│   └── apparel-mcp.service        # systemd user service for Podman
 │
 └── tests/                         # Test suite (pytest + pytest-asyncio)
 ```
@@ -353,7 +502,8 @@ apparel-mcp/
 - [ ] **Phase 2** — S&S Activewear REST client and sync engine
 - [ ] **Phase 3** — Automated cron sync with error notifications
 - [ ] Unit tests and integration test suite
-- [ ] Docker container for deployment
+- [x] Podman/Docker container support
+- [x] GitHub Actions automated sync
 
 ---
 

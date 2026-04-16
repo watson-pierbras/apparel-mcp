@@ -1,0 +1,141 @@
+name: Apparel Data Sync
+
+on:
+  schedule:
+    # Full sync daily at 5:00 AM ET (9:00 UTC during EDT, 10:00 UTC during EST)
+    - cron: "0 9 * * *"
+    # Inventory-only refresh every 4 hours
+    - cron: "0 */4 * * *"
+    # Incremental price check Mon/Wed at 7:00 AM ET (11:00 UTC EDT)
+    - cron: "0 11 * * 1,3"
+
+  # Manual trigger from the Actions tab
+  workflow_dispatch:
+    inputs:
+      supplier:
+        description: "Supplier to sync"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - sanmar
+          - ssactivewear
+      sync_type:
+        description: "Sync type"
+        required: false
+        default: "full"
+        type: choice
+        options:
+          - full
+          - incremental
+          - inventory_only
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ── Determine which sync to run ──────────────────────────────────
+  resolve-task:
+    runs-on: ubuntu-latest
+    outputs:
+      supplier: ${{ steps.resolve.outputs.supplier }}
+      sync_type: ${{ steps.resolve.outputs.sync_type }}
+    steps:
+      - name: Resolve sync parameters
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "supplier=${{ inputs.supplier }}" >> $GITHUB_OUTPUT
+            echo "sync_type=${{ inputs.sync_type }}" >> $GITHUB_OUTPUT
+          else
+            # Determine from cron schedule
+            HOUR=$(date -u +%H)
+            DOW=$(date -u +%u)  # 1=Monday, 7=Sunday
+
+            # Mon/Wed at 11 UTC → incremental price check (SanMar)
+            if [[ "$HOUR" == "11" && ("$DOW" == "1" || "$DOW" == "3") ]]; then
+              echo "supplier=sanmar" >> $GITHUB_OUTPUT
+              echo "sync_type=incremental" >> $GITHUB_OUTPUT
+            # 9 UTC → daily full sync
+            elif [[ "$HOUR" == "09" ]]; then
+              echo "supplier=all" >> $GITHUB_OUTPUT
+              echo "sync_type=full" >> $GITHUB_OUTPUT
+            # Every 4 hours → inventory only
+            else
+              echo "supplier=all" >> $GITHUB_OUTPUT
+              echo "sync_type=inventory_only" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Log sync parameters
+        run: |
+          echo "### Sync Parameters" >> $GITHUB_STEP_SUMMARY
+          echo "- **Supplier:** ${{ steps.resolve.outputs.supplier }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync type:** ${{ steps.resolve.outputs.sync_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+
+  # ── Run the sync ─────────────────────────────────────────────────
+  sync:
+    needs: resolve-task
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Initialize database
+        run: python scripts/setup_db.py
+        env:
+          DB_PATH: ./data/apparel.db
+
+      - name: Download existing database
+        # Restore the DB artifact from the last successful run so we don't
+        # start fresh every time. If no artifact exists yet, this is a no-op.
+        uses: actions/download-artifact@v4
+        with:
+          name: apparel-db
+          path: ./data/
+        continue-on-error: true
+
+      - name: Run sync
+        env:
+          DB_PATH: ./data/apparel.db
+          SANMAR_CUSTOMER_NUMBER: ${{ secrets.SANMAR_CUSTOMER_NUMBER }}
+          SANMAR_USERNAME: ${{ secrets.SANMAR_USERNAME }}
+          SANMAR_PASSWORD: ${{ secrets.SANMAR_PASSWORD }}
+          SS_ACCOUNT_NUMBER: ${{ secrets.SS_ACCOUNT_NUMBER }}
+          SS_API_KEY: ${{ secrets.SS_API_KEY }}
+        run: |
+          python scripts/run_sync.py \
+            --supplier ${{ needs.resolve-task.outputs.supplier }} \
+            --type ${{ needs.resolve-task.outputs.sync_type }}
+
+      - name: Upload database artifact
+        # Persist the DB between runs so price_history accumulates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apparel-db
+          path: ./data/apparel.db
+          retention-days: 90
+          overwrite: true
+
+      - name: Sync summary
+        if: always()
+        run: |
+          echo "### Sync Result" >> $GITHUB_STEP_SUMMARY
+          echo "- **Supplier:** ${{ needs.resolve-task.outputs.supplier }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Type:** ${{ needs.resolve-task.outputs.sync_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Completed:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY

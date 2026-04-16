@@ -1,0 +1,14 @@
+.git
+.github
+.env
+data/*.db
+data/*.db-wal
+data/*.db-shm
+__pycache__
+*.pyc
+.pytest_cache
+dist
+*.egg-info
+.venv
+tests
+README.md

@@ -1,0 +1,23 @@
+[Unit]
+Description=Apparel MCP Server (SanMar + S&S Activewear)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+ExecStartPre=-/usr/bin/podman stop apparel-mcp
+ExecStartPre=-/usr/bin/podman rm apparel-mcp
+
+ExecStart=/usr/bin/podman run \
+  --name apparel-mcp \
+  -p 127.0.0.1:8020:8000 \
+  --env-file %h/.config/mcp-env/apparel-mcp.env \
+  -v apparel-mcp-data:/app/data:Z \
+  apparel-mcp
+
+ExecStop=/usr/bin/podman stop apparel-mcp
+
+[Install]
+WantedBy=default.target
