@@ -196,6 +196,26 @@ class SSClient:
         logger.info(f"S&S get_products({style}): {len(data)} SKUs returned")
         return data
 
+    async def get_products_by_style_id(self, style_id: int) -> list[dict]:
+        """Fetch all product SKUs using the numeric styleID (most reliable method).
+
+        This is the approach used by vendo-server — fetches via ?styleId={numeric}
+        which is the most reliable way to get S&S product data.
+
+        Args:
+            style_id: Numeric S&S styleID (e.g. 9182)
+
+        Returns:
+            List of product dicts (one per SKU/color/size combo).
+        """
+        data = await self._get("/products/", params={"styleId": style_id})
+        if not data:
+            return []
+        if not isinstance(data, list):
+            data = [data]
+        logger.info(f"S&S get_products_by_style_id({style_id}): {len(data)} SKUs returned")
+        return data
+
     async def get_style(self, style: str) -> dict | None:
         """Get style-level info (brand, title, description, category).
 

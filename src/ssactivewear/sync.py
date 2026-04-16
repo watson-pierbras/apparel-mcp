@@ -33,9 +33,9 @@ class SSSync:
             # Start sync log
             log_id = await self._start_sync_log(db, sync_type)
 
-            # Get active tracked styles
+            # Get active tracked styles (include style_id for optimized fetches)
             cursor = await db.execute(
-                "SELECT id, style, brand FROM tracked_styles "
+                "SELECT id, style, brand, style_id FROM tracked_styles "
                 "WHERE supplier = 'ssactivewear' AND is_active = 1"
             )
             styles = await cursor.fetchall()
@@ -48,9 +48,10 @@ class SSSync:
             logger.info(f"Syncing {len(styles)} active S&S Activewear styles...")
 
             for row in styles:
-                style_id, style, brand = row["id"], row["style"], row["brand"]
+                tracked_id, style, brand = row["id"], row["style"], row["brand"]
+                ss_style_id = row["style_id"]  # numeric S&S styleID (may be None)
                 try:
-                    await self._sync_single_style(db, style_id, style, sync_type)
+                    await self._sync_single_style(db, tracked_id, style, sync_type, ss_style_id)
                     result.styles_synced += 1
                 except SSActivewearAPIError as e:
                     result.errors += 1
@@ -108,13 +109,21 @@ class SSSync:
         return result
 
     async def _sync_single_style(
-        self, db: aiosqlite.Connection, tracked_style_id: int, style: str, sync_type: str
+        self, db: aiosqlite.Connection, tracked_style_id: int, style: str,
+        sync_type: str, ss_style_id: int | None = None,
     ) -> None:
         """Sync a single style: fetch from API, detect price changes, upsert."""
         now = datetime.now(timezone.utc).isoformat()
 
-        # Fetch all product SKUs (includes pricing and inventory)
-        raw_products = await self.client.get_products(style)
+        # Prefer styleID-based fetch (most reliable) — fall back to style name
+        raw_products = None
+        if ss_style_id:
+            logger.info(f"Fetching S&S products via styleID={ss_style_id} for {style}")
+            raw_products = await self.client.get_products_by_style_id(ss_style_id)
+
+        if not raw_products:
+            logger.info(f"Falling back to name-based fetch for S&S style {style}")
+            raw_products = await self.client.get_products(style)
 
         if not raw_products:
             logger.warning(f"No product variants returned for S&S style {style}")
@@ -137,20 +146,42 @@ class SSSync:
             description = style_info.get("description", "")
             category = style_info.get("baseCategory", "")
 
+        # Auto-discover styleID from API response if we don't have it
+        discovered_style_id = None
+        if not ss_style_id and raw_products:
+            first_raw = raw_products[0]
+            discovered_style_id = first_raw.get("styleID")
+
         # Update tracked_styles with brand/title/category from API
         first = products[0]
-        await db.execute(
-            "UPDATE tracked_styles SET brand = ?, title = ?, description = ?, "
-            "category = ?, last_synced = ? WHERE id = ?",
-            (
-                first.brand,
-                title or f"{first.brand} {first.style}",
-                description,
-                category,
-                now,
-                tracked_style_id,
-            ),
-        )
+        if discovered_style_id:
+            await db.execute(
+                "UPDATE tracked_styles SET brand = ?, title = ?, description = ?, "
+                "category = ?, style_id = ?, last_synced = ? WHERE id = ?",
+                (
+                    first.brand,
+                    title or f"{first.brand} {first.style}",
+                    description,
+                    category,
+                    discovered_style_id,
+                    now,
+                    tracked_style_id,
+                ),
+            )
+            logger.info(f"Discovered and stored styleID={discovered_style_id} for {style}")
+        else:
+            await db.execute(
+                "UPDATE tracked_styles SET brand = ?, title = ?, description = ?, "
+                "category = ?, last_synced = ? WHERE id = ?",
+                (
+                    first.brand,
+                    title or f"{first.brand} {first.style}",
+                    description,
+                    category,
+                    now,
+                    tracked_style_id,
+                ),
+            )
 
         for product in products:
             product.tracked_style_id = tracked_style_id

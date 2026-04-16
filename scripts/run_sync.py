@@ -46,8 +46,17 @@ async def run_sanmar_sync(sync_type: str):
 
 async def run_ss_sync(sync_type: str):
     """Run S&S Activewear sync."""
-    # S&S sync will be implemented in Phase 2
-    print("S&S Activewear sync not yet implemented. Coming in Phase 2.")
+    from src.ssactivewear.sync import SSSync
+    syncer = SSSync()
+    result = await syncer.sync_all_active(sync_type)
+    print(f"\nS&S sync {result.status}:")
+    print(f"  Styles synced: {result.styles_synced}")
+    print(f"  SKUs updated:  {result.skus_updated}")
+    print(f"  Price changes: {result.price_changes}")
+    print(f"  Errors:        {result.errors}")
+    if result.error_details:
+        for err in result.error_details:
+            print(f"    - {err}")
 
 
 async def main_async(supplier: str, sync_type: str):

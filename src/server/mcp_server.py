@@ -35,6 +35,168 @@ from src.shared.formatters import (
 
 DB_PATH = get_db_path()
 
+
+# ─────────────────────────────────────────────────────────────
+# Live API fallback helpers (DB-first, live only if not in DB)
+# ─────────────────────────────────────────────────────────────
+
+async def _try_live_search(query: str = "", brand: str = "", supplier: str = "") -> str | None:
+    """Try searching live APIs when DB returns no results."""
+    results = []
+
+    # Try S&S live
+    if not supplier or supplier == "ssactivewear":
+        try:
+            from src.ssactivewear.client import SSClient
+            client = SSClient()
+            if query:
+                style_results = await client.search_styles(query=query, brand=brand)
+            elif brand:
+                style_results = await client.search_styles(brand=brand)
+            else:
+                style_results = []
+
+            for st in style_results[:10]:
+                name = st.get("styleName", "")
+                br = st.get("brandName", "")
+                title = st.get("title", "")
+                cat = st.get("baseCategory", "")
+                results.append(f"**{br} {name}** [S&S] — {title} ({cat})")
+        except Exception as e:
+            logger.warning(f"S&S live search fallback failed: {e}")
+
+    # Try SanMar live
+    if not supplier or supplier == "sanmar":
+        try:
+            from src.sanmar.client import SanMarClient
+            from src.sanmar.mapper import map_product_info_response
+            client = SanMarClient()
+            search_term = query or brand
+            if search_term:
+                response = client.get_product_info(search_term)
+                products = map_product_info_response(response)
+                seen = set()
+                for p in products:
+                    if p.style not in seen:
+                        seen.add(p.style)
+                        results.append(f"**{p.brand} {p.style}** [SanMar]")
+                    if len(seen) >= 10:
+                        break
+        except Exception as e:
+            logger.warning(f"SanMar live search fallback failed: {e}")
+
+    if not results:
+        return None
+
+    header = "*(Results from live API — style not in local database)*\n\n"
+    footer = "\n\n*Use `add_tracked_style` to start tracking any of these styles.*"
+    return header + "\n".join(results) + footer
+
+
+async def _try_live_pricing(style: str, supplier: str = "") -> str | None:
+    """Try fetching live pricing when DB returns no results."""
+    # Try S&S
+    if not supplier or supplier == "ssactivewear":
+        try:
+            from src.ssactivewear.client import SSClient
+            client = SSClient()
+            products = await client.get_products(style)
+            if products:
+                lines = [f"*(Live pricing from S&S API — not in local database)*\n"]
+                lines.append(f"**{products[0].get('brandName', '')} {products[0].get('styleName', style)}**\n")
+                lines.append("| Color | Size | Piece | Case | Sale |")
+                lines.append("|-------|------|-------|------|------|")
+                for p in products[:50]:  # Cap at 50 rows
+                    piece = f"${p.get('piecePrice', 0):.2f}" if p.get("piecePrice") else "-"
+                    case = f"${p.get('casePrice', 0):.2f}" if p.get("casePrice") else "-"
+                    sale = f"${p.get('salePrice', 0):.2f}" if p.get("salePrice") else "-"
+                    lines.append(f"| {p.get('colorName', '')} | {p.get('sizeName', '')} | {piece} | {case} | {sale} |")
+                if len(products) > 50:
+                    lines.append(f"\n*Showing 50 of {len(products)} SKUs*")
+                lines.append("\n*Use `add_tracked_style` to track this style locally.*")
+                return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"S&S live pricing fallback failed: {e}")
+
+    # Try SanMar
+    if not supplier or supplier == "sanmar":
+        try:
+            from src.sanmar.client import SanMarClient
+            from src.sanmar.mapper import map_product_info_response
+            client = SanMarClient()
+            response = client.get_product_info(style)
+            products = map_product_info_response(response)
+            if products:
+                lines = [f"*(Live pricing from SanMar API — not in local database)*\n"]
+                lines.append(f"**{products[0].brand} {products[0].style}**\n")
+                lines.append("| Color | Size | Piece | Case | Sale |")
+                lines.append("|-------|------|-------|------|------|")
+                for p in products[:50]:
+                    piece = f"${p.piece_price:.2f}" if p.piece_price else "-"
+                    case = f"${p.case_price:.2f}" if p.case_price else "-"
+                    sale = f"${p.sale_price:.2f}" if p.sale_price else "-"
+                    lines.append(f"| {p.color} | {p.size} | {piece} | {case} | {sale} |")
+                if len(products) > 50:
+                    lines.append(f"\n*Showing 50 of {len(products)} SKUs*")
+                lines.append("\n*Use `add_tracked_style` to track this style locally.*")
+                return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"SanMar live pricing fallback failed: {e}")
+
+    return None
+
+
+async def _try_live_inventory(style: str, supplier: str = "") -> str | None:
+    """Try fetching live inventory when DB returns no results."""
+    # Try S&S
+    if not supplier or supplier == "ssactivewear":
+        try:
+            from src.ssactivewear.client import SSClient
+            client = SSClient()
+            products = await client.get_products(style)
+            if products:
+                wh_totals: dict[str, int] = {}
+                for prod in products:
+                    for wh in prod.get("warehouses", []):
+                        abbr = wh.get("warehouseAbbr", "")
+                        wh_totals[abbr] = wh_totals.get(abbr, 0) + wh.get("qty", 0)
+                if wh_totals:
+                    lines = [f"*(Live inventory from S&S API — not in local database)*\n"]
+                    lines.append(f"**S&S {style}**\n")
+                    total = 0
+                    for wh, qty in sorted(wh_totals.items()):
+                        lines.append(f"  {wh}: {qty:,} units")
+                        total += qty
+                    lines.append(f"\n  **Total: {total:,} units**")
+                    lines.append("\n*Use `add_tracked_style` to track this style locally.*")
+                    return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"S&S live inventory fallback failed: {e}")
+
+    # Try SanMar
+    if not supplier or supplier == "sanmar":
+        try:
+            from src.sanmar.client import SanMarClient
+            from src.sanmar.mapper import map_inventory_response
+            client = SanMarClient()
+            response = client.get_inventory(style)
+            levels = map_inventory_response(response, style)
+            if levels:
+                lines = [f"*(Live inventory from SanMar API — not in local database)*\n"]
+                lines.append(f"**SanMar {style}**\n")
+                total = 0
+                for lv in levels:
+                    lines.append(f"  {lv.warehouse} ({lv.warehouse_name}): {lv.quantity:,} units")
+                    total += lv.quantity
+                lines.append(f"\n  **Total: {total:,} units**")
+                lines.append("\n*Use `add_tracked_style` to track this style locally.*")
+                return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"SanMar live inventory fallback failed: {e}")
+
+    return None
+
+
 mcp = FastMCP(
     "apparel-mcp",
     instructions=(
@@ -134,6 +296,13 @@ async def search_products(
         rows = [dict(row) for row in await cursor.fetchall()]
 
     if not rows:
+        # Live API fallback
+        try:
+            live = await _try_live_search(query=query, brand=brand, supplier=supplier)
+            if live:
+                return live
+        except Exception as e:
+            logger.warning(f"Live search fallback failed: {e}")
         return "No products found matching your search."
 
     lines = []
@@ -208,6 +377,13 @@ async def get_pricing(
         rows = [dict(row) for row in await cursor.fetchall()]
 
     if not rows:
+        # Live API fallback
+        try:
+            live = await _try_live_pricing(style, supplier)
+            if live:
+                return live
+        except Exception as e:
+            logger.warning(f"Live pricing fallback failed: {e}")
         return f"No pricing data found for style '{style}'. Make sure it's in your tracked styles."
 
     return format_pricing_table(rows)
@@ -268,6 +444,13 @@ async def check_inventory(
         rows = [dict(row) for row in await cursor.fetchall()]
 
     if not rows:
+        # Live API fallback
+        try:
+            live = await _try_live_inventory(style, supplier)
+            if live:
+                return live
+        except Exception as e:
+            logger.warning(f"Live inventory fallback failed: {e}")
         return f"No inventory data found for style '{style}'."
 
     # Add total summary
@@ -389,6 +572,13 @@ async def compare_pricing(
         rows = [dict(row) for row in await cursor.fetchall()]
 
     if not rows:
+        # Live API fallback — try both suppliers
+        try:
+            live = await _try_live_pricing(style)
+            if live:
+                return live
+        except Exception as e:
+            logger.warning(f"Live compare fallback failed: {e}")
         return f"No data found for style '{style}' in either supplier."
 
     # Group by supplier for summary

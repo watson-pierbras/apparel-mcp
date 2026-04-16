@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS tracked_styles (
     title       TEXT,
     description TEXT,
     category    TEXT,
+    style_id    INTEGER,
     is_active   BOOLEAN NOT NULL DEFAULT 1,
     added_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_synced TIMESTAMP,
@@ -171,6 +172,8 @@ CREATE INDEX IF NOT EXISTS idx_sync_log_supplier_completed
     ON sync_log(supplier, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tracked_styles_supplier_active
     ON tracked_styles(supplier, is_active);
+CREATE INDEX IF NOT EXISTS idx_tracked_styles_style_id
+    ON tracked_styles(style_id) WHERE style_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_price_alerts_supplier_style
     ON price_alerts(supplier, style);
 CREATE INDEX IF NOT EXISTS idx_alert_history_triggered
