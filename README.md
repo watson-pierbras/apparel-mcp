@@ -20,6 +20,7 @@ Rather than hitting supplier APIs on every query, this server syncs product, pri
 - [Automating Sync with Cron](#automating-sync-with-cron)
 - [GitHub Actions (Automated Sync)](#github-actions-automated-sync)
 - [Running with Podman](#running-with-podman)
+- [Admin Dashboard](#admin-dashboard)
 - [Project Structure](#project-structure)
 
 ---
@@ -448,6 +449,42 @@ The server will auto-start on login and restart on failure.
 
 ---
 
+## Admin Dashboard
+
+A Streamlit web UI for managing the database, browsing pricing, setting alerts, and monitoring sync health.
+
+### Launch
+
+```bash
+cd apparel-mcp
+streamlit run dashboard/app.py
+```
+
+Opens at [http://localhost:8501](http://localhost:8501).
+
+### Pages
+
+| Page | What It Does |
+|------|-------------|
+| **Sync Overview** | Last sync status per supplier, success/failure counts, full history log with color-coded rows |
+| **Tracked Styles** | Add/remove styles, toggle active/inactive, filter by supplier, view product counts |
+| **Pricing Browser** | Browse all products with pricing tiers, filter by supplier/brand/style/color, quick stats |
+| **Price Alerts** | Set min/max price thresholds per style, toggle alerts, view triggered alert history |
+| **Inventory** | Warehouse-level stock, low-stock highlighting (configurable threshold), summary by warehouse |
+| **Price History** | Interactive Plotly charts of price changes over time, filterable by price type, change log table |
+| **Settings** | Default supplier, low-stock threshold, alert preferences, CSV export for any table, danger zone (clear logs) |
+
+### Price Alerts
+
+Set per-style thresholds from the Price Alerts page:
+
+- **Min price** — alert triggers when a product's price drops below this value
+- **Max price** — alert triggers when a product's price rises above this value
+- Alerts can target a specific color or apply to all colors for a style
+- The `price_alerts` and `alert_history` tables are integrated into the sync engine
+
+---
+
 ## Project Structure
 
 ```
@@ -486,6 +523,18 @@ apparel-mcp/
 │   └── workflows/
 │       └── sync.yml               # GitHub Actions scheduled sync
 │
+├── dashboard/
+│   ├── app.py                     # Streamlit entry point
+│   ├── db_utils.py                # Shared DB helpers, settings I/O
+│   └── pages/                     # One module per dashboard page
+│       ├── sync_overview.py
+│       ├── tracked_styles.py
+│       ├── pricing_browser.py
+│       ├── price_alerts.py
+│       ├── inventory.py
+│       ├── price_history.py
+│       └── settings.py
+│
 ├── Containerfile                  # Podman/Docker container build
 ├── .containerignore               # Build context exclusions
 ├── contrib/
@@ -504,6 +553,7 @@ apparel-mcp/
 - [ ] Unit tests and integration test suite
 - [x] Podman/Docker container support
 - [x] GitHub Actions automated sync
+- [x] Streamlit admin dashboard with price alerts
 
 ---
 

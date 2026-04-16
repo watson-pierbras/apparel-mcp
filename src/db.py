@@ -97,6 +97,37 @@ CREATE TABLE IF NOT EXISTS price_history (
 );
 
 -- ============================================================
+-- PRICE ALERTS
+-- ============================================================
+CREATE TABLE IF NOT EXISTS price_alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier        TEXT NOT NULL,
+    style           TEXT NOT NULL,
+    color_name      TEXT,
+    size            TEXT,
+    min_price       REAL,
+    max_price       REAL,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(supplier, style, color_name, size)
+);
+
+-- ============================================================
+-- ALERT HISTORY
+-- ============================================================
+CREATE TABLE IF NOT EXISTS alert_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id        INTEGER NOT NULL REFERENCES price_alerts(id),
+    triggered_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    old_price       REAL NOT NULL,
+    new_price       REAL NOT NULL,
+    direction       TEXT NOT NULL,
+    style           TEXT NOT NULL,
+    color_name      TEXT,
+    size            TEXT
+);
+
+-- ============================================================
 -- SYNC LOG
 -- ============================================================
 CREATE TABLE IF NOT EXISTS sync_log (
@@ -140,6 +171,10 @@ CREATE INDEX IF NOT EXISTS idx_sync_log_supplier_completed
     ON sync_log(supplier, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tracked_styles_supplier_active
     ON tracked_styles(supplier, is_active);
+CREATE INDEX IF NOT EXISTS idx_price_alerts_supplier_style
+    ON price_alerts(supplier, style);
+CREATE INDEX IF NOT EXISTS idx_alert_history_triggered
+    ON alert_history(triggered_at DESC);
 """
 
 PRAGMAS_SQL = """
