@@ -111,6 +111,61 @@ class SanMarClient:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
+    def get_product_info_by_brand(self, brand: str) -> Any:
+        """
+        Get all products for a brand.
+        
+        WARNING: This can return large datasets and may timeout for big brands.
+        Brand names must match SanMar's exact naming (e.g. 'Port & Co', 'Sport-Tek').
+        """
+        client = self._get_product_client()
+        logger.info(f"Fetching products by brand: {brand}")
+
+        response = client.service.getProductInfoByBrand(
+            arg0=brand,
+            arg1=self._credentials,
+        )
+
+        if hasattr(response, "errorOccurred") and response.errorOccurred:
+            msg = getattr(response, "message", "Unknown SanMar API error")
+            raise SanMarAPIError(f"SanMar API error for brand {brand}: {msg}")
+
+        return response
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    def get_product_info_by_category(self, category: str) -> Any:
+        """
+        Get all products for a category.
+        
+        WARNING: This can return large datasets and may timeout for big categories.
+        Category names: T-Shirts, Activewear, Fleece, Caps, Outerwear, Polos/Knits,
+        Woven Shirts, Bags, Accessories.
+        """
+        client = self._get_product_client()
+        logger.info(f"Fetching products by category: {category}")
+
+        response = client.service.getProductInfoByCategory(
+            arg0=category,
+            arg1=self._credentials,
+        )
+
+        if hasattr(response, "errorOccurred") and response.errorOccurred:
+            msg = getattr(response, "message", "Unknown SanMar API error")
+            raise SanMarAPIError(f"SanMar API error for category {category}: {msg}")
+
+        return response
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
     def get_pricing(
         self,
         style: str,

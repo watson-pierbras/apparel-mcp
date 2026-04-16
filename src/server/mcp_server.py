@@ -7,6 +7,8 @@ from typing import Optional
 
 from fastmcp import FastMCP
 from dotenv import load_dotenv
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # Ensure all logging goes to stderr (stdout is reserved for MCP JSON-RPC)
 logging.basicConfig(
@@ -43,6 +45,26 @@ mcp = FastMCP(
         "inventory before placing an actual order."
     ),
 )
+
+
+# ─────────────────────────────────────────────────────────────
+# Well-known endpoints so MCP clients skip OAuth discovery
+# ─────────────────────────────────────────────────────────────
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    """Tell MCP clients this server requires no authentication."""
+    return JSONResponse({"resource": request.url.scheme + "://" + request.url.netloc + "/mcp"})
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    return JSONResponse({}, status_code=404)
+
+
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+async def openid_configuration(request: Request) -> JSONResponse:
+    return JSONResponse({}, status_code=404)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -685,6 +707,211 @@ async def sync_status(supplier: str = "") -> str:
         )
 
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+# Tool 11: search_sanmar_live
+# ─────────────────────────────────────────────────────────────
+@mcp.tool()
+async def search_sanmar_live(
+    style: str = "",
+    brand: str = "",
+    category: str = "",
+) -> str:
+    """Search SanMar's catalog in REAL-TIME via their API.
+
+    Use this to browse SanMar products live — find new styles, explore
+    brands, or look up a specific style number before adding it to tracking.
+
+    You must provide at least one of: style, brand, or category.
+
+    Args:
+        style: Style number to look up (e.g. 'PC61', 'K540', 'G500')
+        brand: Brand name — must match SanMar exactly. Options include:
+               Port & Co, Sport-Tek, District, Gildan, Bella+Canvas,
+               Nike, The North Face, Carhartt, Next Level, Comfort Colors,
+               Champion, Hanes, New Era, OGIO, Eddie Bauer, etc.
+        category: Category name. Options: T-Shirts, Activewear, Fleece,
+                  Caps, Outerwear, Polos/Knits, Woven Shirts, Bags, Accessories
+    """
+    if not any([style, brand, category]):
+        return "Please provide at least one of: style, brand, or category."
+
+    try:
+        from src.sanmar.client import SanMarClient
+        from src.sanmar.mapper import map_product_info_response
+
+        client = SanMarClient()
+
+        if style:
+            # Direct style lookup — fastest, most specific
+            response = client.get_product_info(style)
+        elif brand:
+            response = client.get_product_info_by_brand(brand)
+        elif category:
+            response = client.get_product_info_by_category(category)
+        else:
+            return "Please provide style, brand, or category."
+
+        products = map_product_info_response(response)
+
+        if not products:
+            return f"No products found for {'style ' + style if style else 'brand ' + brand if brand else 'category ' + category}."
+
+        # Deduplicate to style level — group variants by style number
+        styles_seen: dict[str, dict] = {}
+        for p in products:
+            key = p.style
+            if key not in styles_seen:
+                styles_seen[key] = {
+                    "style": p.style,
+                    "brand": p.brand,
+                    "title": p.title,
+                    "category": p.category,
+                    "colors": set(),
+                    "sizes": set(),
+                    "min_price": p.piece_price,
+                    "max_price": p.piece_price,
+                    "case_price": p.case_price,
+                    "image": p.image_url or "",
+                }
+            s = styles_seen[key]
+            if p.color:
+                s["colors"].add(p.color)
+            if p.size:
+                s["sizes"].add(p.size)
+            if p.piece_price:
+                if s["min_price"] is None or p.piece_price < s["min_price"]:
+                    s["min_price"] = p.piece_price
+                if s["max_price"] is None or p.piece_price > s["max_price"]:
+                    s["max_price"] = p.piece_price
+
+        # Format output — limit to 25 styles to keep response manageable
+        style_list = list(styles_seen.values())[:25]
+        total = len(styles_seen)
+
+        lines = [f"**SanMar Live Search** — {total} styles found"]
+        if total > 25:
+            lines[0] += f" (showing first 25)"
+        lines.append("")
+
+        for s in style_list:
+            price_str = ""
+            if s["min_price"]:
+                if s["min_price"] == s["max_price"]:
+                    price_str = f"${s['min_price']:.2f}/pc"
+                else:
+                    price_str = f"${s['min_price']:.2f}–${s['max_price']:.2f}/pc"
+            if s["case_price"]:
+                price_str += f" (case: ${s['case_price']:.2f})"
+
+            lines.append(f"### {s['style']} — {s['title']}")
+            lines.append(f"Brand: {s['brand']} | Category: {s['category']}")
+            lines.append(f"Colors: {len(s['colors'])} | Sizes: {', '.join(sorted(s['sizes']))}")
+            if price_str:
+                lines.append(f"Price: {price_str}")
+            if s["image"]:
+                lines.append(f"Image: {s['image']}")
+            lines.append("")
+
+        if total > 25:
+            lines.append(f"*{total - 25} more styles not shown. Narrow your search with a style number or more specific brand/category.*")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error searching SanMar live: {str(e)}"
+
+
+# ─────────────────────────────────────────────────────────────
+# Tool 12: get_live_pricing
+# ─────────────────────────────────────────────────────────────
+@mcp.tool()
+async def get_live_pricing(
+    style: str,
+    color: str = "",
+    size: str = "",
+) -> str:
+    """Get REAL-TIME pricing for a style directly from SanMar's API.
+
+    Bypasses the cached database and queries SanMar live. Use when you
+    need guaranteed-current pricing, such as before quoting a customer
+    or placing an order.
+
+    Args:
+        style: Style number (e.g. 'PC61', 'K420', 'G500')
+        color: Optional color filter (e.g. 'Black', 'White')
+        size: Optional size filter (e.g. 'M', 'XL', '2XL')
+    """
+    try:
+        from src.sanmar.client import SanMarClient
+        from src.sanmar.mapper import map_product_info_response
+
+        client = SanMarClient()
+        response = client.get_product_info(style, color, size)
+        products = map_product_info_response(response)
+
+        if not products:
+            return f"No pricing data returned from SanMar for style {style}."
+
+        # Group by color for a clean pricing table
+        color_groups: dict[str, list] = {}
+        for p in products:
+            key = p.color or "Unknown"
+            if key not in color_groups:
+                color_groups[key] = []
+            color_groups[key].append(p)
+
+        lines = [f"**LIVE Pricing for SanMar {style}** (real-time from API)\n"]
+
+        # If a specific color was requested or only one color exists
+        if len(color_groups) == 1 or color:
+            lines.append("| Color | Size | Piece | Case | Sale |")
+            lines.append("|-------|------|-------|------|------|")
+            for c_name, variants in sorted(color_groups.items()):
+                for v in sorted(variants, key=lambda x: x.size_index or 999):
+                    piece = f"${v.piece_price:.2f}" if v.piece_price else "-"
+                    case = f"${v.case_price:.2f}" if v.case_price else "-"
+                    sale = f"${v.sale_price:.2f}" if v.sale_price else "-"
+                    lines.append(f"| {c_name} | {v.size} | {piece} | {case} | {sale} |")
+        else:
+            # Multiple colors — show summary per color with size range pricing
+            lines.append("| Color | Sizes | Piece Range | Case Price |")
+            lines.append("|-------|-------|-------------|------------|")
+            for c_name, variants in sorted(color_groups.items()):
+                sizes = sorted(set(v.size for v in variants))
+                prices = [v.piece_price for v in variants if v.piece_price]
+                case_prices = [v.case_price for v in variants if v.case_price]
+
+                if prices:
+                    min_p, max_p = min(prices), max(prices)
+                    if min_p == max_p:
+                        price_str = f"${min_p:.2f}"
+                    else:
+                        price_str = f"${min_p:.2f}–${max_p:.2f}"
+                else:
+                    price_str = "-"
+
+                case_str = f"${case_prices[0]:.2f}" if case_prices else "-"
+                size_str = ", ".join(sizes[:6])
+                if len(sizes) > 6:
+                    size_str += f" +{len(sizes)-6} more"
+
+                lines.append(f"| {c_name} | {size_str} | {price_str} | {case_str} |")
+
+        lines.append(f"\n*{len(products)} total SKUs across {len(color_groups)} colors*")
+
+        # Add product title and image if available
+        first = products[0]
+        if first.title:
+            lines.insert(1, f"*{first.title}*\n")
+        if first.image_url:
+            lines.append(f"\nProduct image: {first.image_url}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching live pricing: {str(e)}"
 
 
 def main():
