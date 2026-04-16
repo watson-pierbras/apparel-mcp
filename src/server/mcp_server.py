@@ -914,6 +914,240 @@ async def get_live_pricing(
         return f"Error fetching live pricing: {str(e)}"
 
 
+# ─────────────────────────────────────────────────────────────
+# Tool 13: search_ss_live
+# ─────────────────────────────────────────────────────────────
+@mcp.tool()
+async def search_ss_live(
+    style: str = "",
+    brand: str = "",
+    query: str = "",
+) -> str:
+    """Search S&S Activewear's catalog in REAL-TIME via their API.
+
+    Use this to browse S&S products live — find Alleson, Bella+Canvas,
+    Next Level, Gildan, and other styles before adding them to tracking.
+
+    You must provide at least one of: style, brand, or query.
+
+    Args:
+        style: Style number or part number (e.g. '8668', '00760', '3001')
+        brand: Brand name (e.g. 'Alleson Athletic', 'Bella+Canvas', 'Next Level')
+        query: Keyword search (e.g. 'track singlet', 'performance tee')
+    """
+    if not any([style, brand, query]):
+        return "Please provide at least one of: style, brand, or query."
+
+    try:
+        from src.ssactivewear.client import SSClient
+        from src.ssactivewear.mapper import map_products_response
+
+        client = SSClient()
+
+        if style:
+            # Direct product lookup by style — most specific
+            raw_products = await client.get_products(style)
+
+            if not raw_products:
+                return f"No products found for S&S style '{style}'."
+
+            # Group SKUs by style name
+            styles_seen: dict[str, dict] = {}
+            for p in raw_products:
+                key = p.get("styleName", style)
+                if key not in styles_seen:
+                    styles_seen[key] = {
+                        "style": key,
+                        "brand": p.get("brandName", ""),
+                        "colors": set(),
+                        "sizes": set(),
+                        "min_price": p.get("piecePrice"),
+                        "max_price": p.get("piecePrice"),
+                        "case_price": p.get("casePrice"),
+                        "image": p.get("colorFrontImage", ""),
+                    }
+                s = styles_seen[key]
+                if p.get("colorName"):
+                    s["colors"].add(p["colorName"])
+                if p.get("sizeName"):
+                    s["sizes"].add(p["sizeName"])
+                pp = p.get("piecePrice")
+                if pp:
+                    if s["min_price"] is None or pp < s["min_price"]:
+                        s["min_price"] = pp
+                    if s["max_price"] is None or pp > s["max_price"]:
+                        s["max_price"] = pp
+
+        else:
+            # Keyword or brand search via styles endpoint
+            search_term = brand or query
+            style_results = await client.search_styles(search_term)
+
+            if not style_results:
+                return f"No styles found for S&S search '{search_term}'."
+
+            styles_seen = {}
+            for st in style_results:
+                key = st.get("styleName") or st.get("partNumber") or str(st.get("styleID", ""))
+                if key and key not in styles_seen:
+                    styles_seen[key] = {
+                        "style": key,
+                        "brand": st.get("brandName", ""),
+                        "colors": set(),
+                        "sizes": set(),
+                        "min_price": None,
+                        "max_price": None,
+                        "case_price": None,
+                        "image": st.get("styleImage", ""),
+                        "title": st.get("title", ""),
+                        "category": st.get("baseCategory", ""),
+                    }
+
+        # Format output — limit to 25 styles
+        style_list = list(styles_seen.values())[:25]
+        total = len(styles_seen)
+
+        lines = [f"**S&S Activewear Live Search** — {total} styles found"]
+        if total > 25:
+            lines[0] += f" (showing first 25)"
+        lines.append("")
+
+        cdn_base = "https://cdn.ssactivewear.com/"
+
+        for s in style_list:
+            price_str = ""
+            if s.get("min_price"):
+                if s["min_price"] == s.get("max_price"):
+                    price_str = f"${s['min_price']:.2f}/pc"
+                else:
+                    price_str = f"${s['min_price']:.2f}–${s['max_price']:.2f}/pc"
+            if s.get("case_price"):
+                price_str += f" (case: ${s['case_price']:.2f})"
+
+            lines.append(f"### {s['style']} — {s['brand']}")
+            if s.get("title"):
+                lines.append(f"{s['title']}")
+            if s.get("category"):
+                lines.append(f"Category: {s['category']}")
+            if s["colors"]:
+                lines.append(f"Colors: {len(s['colors'])} | Sizes: {', '.join(sorted(s['sizes']))}")
+            if price_str:
+                lines.append(f"Price: {price_str}")
+            if s.get("image"):
+                img = s["image"]
+                if img and not img.startswith("http"):
+                    img = cdn_base + img
+                lines.append(f"Image: {img}")
+            lines.append("")
+
+        if total > 25:
+            lines.append(f"*{total - 25} more styles not shown. Narrow your search with a style number or more specific brand/query.*")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error searching S&S Activewear live: {str(e)}"
+
+
+# ─────────────────────────────────────────────────────────────
+# Tool 14: get_ss_live_pricing
+# ─────────────────────────────────────────────────────────────
+@mcp.tool()
+async def get_ss_live_pricing(
+    style: str,
+    color: str = "",
+    size: str = "",
+) -> str:
+    """Get REAL-TIME pricing for a style directly from S&S Activewear's API.
+
+    Bypasses the cached database and queries S&S live. Use when you
+    need guaranteed-current pricing, such as before quoting a customer
+    or placing an order.
+
+    Args:
+        style: Style number (e.g. '8668', '3001', '00760')
+        color: Optional color filter (e.g. 'Black', 'White')
+        size: Optional size filter (e.g. 'M', 'XL', '2XL')
+    """
+    try:
+        from src.ssactivewear.client import SSClient
+
+        client = SSClient()
+        products = await client.get_products(style, color, size)
+
+        if not products:
+            return f"No pricing data returned from S&S for style {style}."
+
+        # Group by color for a clean pricing table
+        color_groups: dict[str, list] = {}
+        for p in products:
+            key = p.get("colorName", "Unknown")
+            if key not in color_groups:
+                color_groups[key] = []
+            color_groups[key].append(p)
+
+        lines = [f"**LIVE Pricing for S&S {style}** (real-time from API)\n"]
+
+        # Add brand from first product
+        first = products[0]
+        brand = first.get("brandName", "")
+        style_name = first.get("styleName", style)
+        if brand:
+            lines.insert(1, f"*{brand} {style_name}*\n")
+
+        # If a specific color was requested or only one color exists
+        if len(color_groups) == 1 or color:
+            lines.append("| Color | Size | Piece | Case | Sale | Dozen |")
+            lines.append("|-------|------|-------|------|------|-------|")
+            for c_name, variants in sorted(color_groups.items()):
+                for v in sorted(variants, key=lambda x: x.get("sizeName", "ZZZ")):
+                    piece = f"${v['piecePrice']:.2f}" if v.get("piecePrice") else "-"
+                    case = f"${v['casePrice']:.2f}" if v.get("casePrice") else "-"
+                    sale = f"${v['salePrice']:.2f}" if v.get("salePrice") else "-"
+                    dozen = f"${v['dozenPrice']:.2f}" if v.get("dozenPrice") else "-"
+                    lines.append(f"| {c_name} | {v.get('sizeName', '')} | {piece} | {case} | {sale} | {dozen} |")
+        else:
+            # Multiple colors — show summary per color with size range pricing
+            lines.append("| Color | Sizes | Piece Range | Case Price | Sale |")
+            lines.append("|-------|-------|-------------|------------|------|")
+            for c_name, variants in sorted(color_groups.items()):
+                sizes = sorted(set(v.get("sizeName", "") for v in variants))
+                prices = [v["piecePrice"] for v in variants if v.get("piecePrice")]
+                case_prices = [v["casePrice"] for v in variants if v.get("casePrice")]
+                sale_prices = [v["salePrice"] for v in variants if v.get("salePrice")]
+
+                if prices:
+                    min_p, max_p = min(prices), max(prices)
+                    if min_p == max_p:
+                        price_str = f"${min_p:.2f}"
+                    else:
+                        price_str = f"${min_p:.2f}–${max_p:.2f}"
+                else:
+                    price_str = "-"
+
+                case_str = f"${case_prices[0]:.2f}" if case_prices else "-"
+                sale_str = f"${min(sale_prices):.2f}" if sale_prices else "-"
+                size_str = ", ".join(sizes[:6])
+                if len(sizes) > 6:
+                    size_str += f" +{len(sizes)-6} more"
+
+                lines.append(f"| {c_name} | {size_str} | {price_str} | {case_str} | {sale_str} |")
+
+        lines.append(f"\n*{len(products)} total SKUs across {len(color_groups)} colors*")
+
+        # Add image if available
+        front_img = first.get("colorFrontImage", "")
+        if front_img:
+            if not front_img.startswith("http"):
+                front_img = f"https://cdn.ssactivewear.com/{front_img}"
+            lines.append(f"\nProduct image: {front_img}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error fetching S&S live pricing: {str(e)}"
+
+
 def main():
     """Entry point for the MCP server."""
     import argparse
