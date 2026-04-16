@@ -980,11 +980,11 @@ async def search_ss_live(
 
         else:
             # Keyword or brand search via styles endpoint
-            search_term = brand or query
-            style_results = await client.search_styles(search_term)
+            style_results = await client.search_styles(query=query, brand=brand)
 
             if not style_results:
-                return f"No styles found for S&S search '{search_term}'."
+                search_desc = brand or query
+                return f"No styles found for S&S search '{search_desc}'."
 
             styles_seen = {}
             for st in style_results:
