@@ -712,7 +712,7 @@ def main():
     args = parser.parse_args()
 
     if args.transport == "streamable-http":
-        mcp.run(transport="http", host=args.host, port=args.port)
+        mcp.run(transport="http", host=args.host, port=args.port, stateless_http=True)
     else:
         mcp.run(transport="stdio")
 
