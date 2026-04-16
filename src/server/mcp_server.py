@@ -765,15 +765,14 @@ async def search_sanmar_live(
             if key not in styles_seen:
                 styles_seen[key] = {
                     "style": p.style,
-                    "brand": p.brand,
-                    "title": p.title,
-                    "category": p.category,
+                    "brand": p.brand or "",
                     "colors": set(),
                     "sizes": set(),
                     "min_price": p.piece_price,
                     "max_price": p.piece_price,
                     "case_price": p.case_price,
-                    "image": p.image_url or "",
+                    "image": p.front_image_url or "",
+                    "status": p.product_status or "",
                 }
             s = styles_seen[key]
             if p.color:
@@ -805,8 +804,9 @@ async def search_sanmar_live(
             if s["case_price"]:
                 price_str += f" (case: ${s['case_price']:.2f})"
 
-            lines.append(f"### {s['style']} — {s['title']}")
-            lines.append(f"Brand: {s['brand']} | Category: {s['category']}")
+            lines.append(f"### {s['style']} — {s['brand']}")
+            if s["status"]:
+                lines.append(f"Status: {s['status']}")
             lines.append(f"Colors: {len(s['colors'])} | Sizes: {', '.join(sorted(s['sizes']))}")
             if price_str:
                 lines.append(f"Price: {price_str}")
@@ -869,7 +869,7 @@ async def get_live_pricing(
             lines.append("| Color | Size | Piece | Case | Sale |")
             lines.append("|-------|------|-------|------|------|")
             for c_name, variants in sorted(color_groups.items()):
-                for v in sorted(variants, key=lambda x: x.size_index or 999):
+                for v in sorted(variants, key=lambda x: x.size or "ZZZ"):
                     piece = f"${v.piece_price:.2f}" if v.piece_price else "-"
                     case = f"${v.case_price:.2f}" if v.case_price else "-"
                     sale = f"${v.sale_price:.2f}" if v.sale_price else "-"
@@ -901,12 +901,12 @@ async def get_live_pricing(
 
         lines.append(f"\n*{len(products)} total SKUs across {len(color_groups)} colors*")
 
-        # Add product title and image if available
+        # Add brand and image if available
         first = products[0]
-        if first.title:
-            lines.insert(1, f"*{first.title}*\n")
-        if first.image_url:
-            lines.append(f"\nProduct image: {first.image_url}")
+        if first.brand:
+            lines.insert(1, f"*{first.brand} {first.style}*\n")
+        if first.front_image_url:
+            lines.append(f"\nProduct image: {first.front_image_url}")
 
         return "\n".join(lines)
 
