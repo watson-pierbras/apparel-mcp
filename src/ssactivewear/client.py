@@ -123,6 +123,12 @@ class SSClient:
     ) -> list[dict]:
         """Get all product SKUs for a style, with pricing and inventory.
 
+        S&S uses two identifiers: partNumber (S&S internal, e.g. '00760')
+        and styleName (manufacturer's, e.g. '2000', '8668', '3001').
+        The ?style= param accepts partNumber, StyleID, or BrandName+Name.
+        We try ?style= first, then fall back to finding the partNumber
+        via the styles endpoint if no results are returned.
+
         Args:
             style: Style number or part number (e.g. '8668', '00760', 'Gildan 5000')
             color: Optional color name to filter results client-side
@@ -132,7 +138,32 @@ class SSClient:
             List of product dicts (one per SKU/color/size combo), each with
             embedded warehouses[] for inventory.
         """
+        # Try direct ?style= query first (works with partNumber and StyleID)
         data = await self._get("/products/", params={"style": style})
+
+        # If no results, the input might be a manufacturer styleName (e.g. '3001', '8668').
+        # Look up the partNumber via the styles endpoint, then re-query products.
+        if not data:
+            logger.info(f"S&S products ?style={style} returned nothing, trying styles lookup")
+            style_info = await self._get(f"/styles/{style}")
+            if style_info:
+                # styles endpoint may return a list or single dict
+                if isinstance(style_info, list):
+                    # Find exact styleName match if possible
+                    match = None
+                    for s in style_info:
+                        if s.get("styleName", "").upper() == style.upper():
+                            match = s
+                            break
+                    if not match:
+                        match = style_info[0]
+                else:
+                    match = style_info
+
+                part_number = match.get("partNumber", "")
+                if part_number and part_number != style:
+                    logger.info(f"Found partNumber '{part_number}' for styleName '{style}', re-querying products")
+                    data = await self._get("/products/", params={"style": part_number})
 
         if not data:
             return []
