@@ -5,7 +5,7 @@ import sys
 import logging
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from dotenv import load_dotenv
 
 # Ensure all logging goes to stderr (stdout is reserved for MCP JSON-RPC)
@@ -712,7 +712,7 @@ def main():
     args = parser.parse_args()
 
     if args.transport == "streamable-http":
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        mcp.run(transport="http", host=args.host, port=args.port)
     else:
         mcp.run(transport="stdio")
 

@@ -17,17 +17,20 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir -e . 2>/dev/null || \
     (pip install --no-cache-dir \
-      "mcp[cli]>=1.0.0" \
+      "fastmcp>=2.3.0" \
       "zeep>=4.2.1" \
       "httpx>=0.27.0" \
       "pydantic>=2.6.0" \
       "python-dotenv>=1.0.0" \
       "tenacity>=8.2.0" \
-      "aiosqlite>=0.20.0")
+      "aiosqlite>=0.20.0" \
+      "streamlit>=1.38.0" \
+      "plotly>=5.22.0")
 
 # Copy source
 COPY src/ ./src/
 COPY scripts/ ./scripts/
+COPY dashboard/ ./dashboard/
 
 # Create data directory for SQLite
 RUN mkdir -p /app/data
@@ -38,8 +41,8 @@ ENV DB_PATH=/app/data/apparel.db
 # Initialize database on build
 RUN python scripts/setup_db.py
 
-# Expose streamable-http port (for networked MCP transport)
-EXPOSE 8000
+# Expose MCP (8000) and Streamlit dashboard (8501)
+EXPOSE 8000 8501
 
 # Default: run MCP server in streamable-http mode for networked access
 # Override with --transport stdio for direct Claude Desktop pipe
