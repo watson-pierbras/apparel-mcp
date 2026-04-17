@@ -6,6 +6,9 @@ import logging
 from typing import Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.exceptions import ToolError
 from dotenv import load_dotenv
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -210,12 +213,67 @@ mcp = FastMCP(
 
 
 # ─────────────────────────────────────────────────────────────
+# Bearer-token authentication middleware
+# Protects every tool call when MCP_API_KEY is set in the env.
+# When unset (local dev / Claude Desktop stdio), auth is skipped.
+# ─────────────────────────────────────────────────────────────
+
+class BearerAuthMiddleware(Middleware):
+    """Validate `Authorization: Bearer <MCP_API_KEY>` on every tool call."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        headers = get_http_headers() or {}
+        # Accept either Authorization: Bearer <key> or x-api-key: <key>
+        auth_header = headers.get("authorization", "")
+        x_api_key = headers.get("x-api-key", "")
+
+        token = None
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        elif x_api_key:
+            token = x_api_key.strip()
+        elif auth_header:
+            token = auth_header.strip()
+
+        if token != self.api_key:
+            raise ToolError("Unauthorized: invalid or missing API key.")
+
+        return await call_next(context)
+
+
+_MCP_API_KEY = os.getenv("MCP_API_KEY", "").strip()
+if _MCP_API_KEY:
+    mcp.add_middleware(BearerAuthMiddleware(_MCP_API_KEY))
+    logger.info("Bearer auth enabled for tool calls.")
+else:
+    logger.warning(
+        "MCP_API_KEY not set — server is running WITHOUT authentication. "
+        "Do not expose this server publicly in this state."
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Well-known endpoints so MCP clients skip OAuth discovery
 # ─────────────────────────────────────────────────────────────
 
+@mcp.custom_route("/", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Root health check — used by Railway and uptime monitors."""
+    return JSONResponse({
+        "name": "apparel-mcp",
+        "status": "ok",
+        "transport": "streamable-http",
+        "endpoint": "/mcp",
+        "auth": "bearer" if os.getenv("MCP_API_KEY") else "none",
+    })
+
+
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def oauth_protected_resource(request: Request) -> JSONResponse:
-    """Tell MCP clients this server requires no authentication."""
+    """Tell MCP clients this server requires no OAuth (we use a simple bearer)."""
     return JSONResponse({"resource": request.url.scheme + "://" + request.url.netloc + "/mcp"})
 
 
