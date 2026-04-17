@@ -40,9 +40,8 @@ ENV DB_PATH=/app/data/apparel.db
 # sync populates it.
 RUN python scripts/setup_db.py || true
 
-# Railway sets $PORT automatically; default to 8000 for local runs.
-ENV PORT=8000
+# Railway (and Heroku/Fly) inject $PORT at runtime. The server reads it
+# from the environment so we don't need shell expansion here.
 EXPOSE 8000
 
-# Use a shell form so $PORT is expanded at runtime.
-CMD python -m src.server.mcp_server --transport streamable-http --host 0.0.0.0 --port ${PORT}
+CMD ["python", "-m", "src.server.mcp_server", "--transport", "streamable-http", "--host", "0.0.0.0"]

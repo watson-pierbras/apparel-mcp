@@ -1412,11 +1412,14 @@ def main():
         default="127.0.0.1",
         help="Host to bind when using streamable-http (default: 127.0.0.1)",
     )
+    # Default to $PORT (Railway / Heroku / Fly all inject this) or 8000 locally.
+    # Read from env first so `--port` is optional in container deploys.
+    default_port = int(os.getenv("PORT", "8000"))
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="Port to bind when using streamable-http (default: 8000)",
+        default=default_port,
+        help=f"Port to bind when using streamable-http (default: {default_port})",
     )
     args = parser.parse_args()
 
