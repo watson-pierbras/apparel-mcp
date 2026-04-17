@@ -1194,6 +1194,11 @@ async def search_ss_live(
     Use this to browse S&S products live — find Alleson, Bella+Canvas,
     Next Level, Gildan, and other styles before adding them to tracking.
 
+    Passing `brand` together with `style` is strongly recommended when the
+    style number could exist in multiple brands (any short numeric like
+    '3001', '8667', '5000'). Without a brand hint, S&S's API can return the
+    wrong product because short style numbers collide with internal styleIDs.
+
     You must provide at least one of: style, brand, or query.
 
     Args:
@@ -1205,17 +1210,27 @@ async def search_ss_live(
         return "Please provide at least one of: style, brand, or query."
 
     try:
-        from src.ssactivewear.client import SSClient
+        from src.ssactivewear.client import SSClient, SSActivewearAPIError
         from src.ssactivewear.mapper import map_products_response
 
         client = SSClient()
 
         if style:
-            # Direct product lookup by style — most specific
-            raw_products = await client.get_products(style)
+            # Direct product lookup by style — most specific.
+            # Pass `brand` through so we resolve via catalog instead of the
+            # broken ?style= param that collides on styleID.
+            try:
+                raw_products = await client.get_products(style, brand=brand)
+            except SSActivewearAPIError as e:
+                return f"S&S search error: {e}"
 
             if not raw_products:
-                return f"No products found for S&S style '{style}'."
+                hint = f" in brand '{brand}'" if brand else ""
+                return (
+                    f"No products found for S&S style '{style}'{hint}. "
+                    f"If this is a valid style number, try passing a brand hint "
+                    f"(e.g. brand='Alleson Athletic')."
+                )
 
             # Group SKUs by style name
             styles_seen: dict[str, dict] = {}
@@ -1323,6 +1338,7 @@ async def get_ss_live_pricing(
     style: str,
     color: str = "",
     size: str = "",
+    brand: str = "",
 ) -> str:
     """Get REAL-TIME pricing for a style directly from S&S Activewear's API.
 
@@ -1330,19 +1346,41 @@ async def get_ss_live_pricing(
     need guaranteed-current pricing, such as before quoting a customer
     or placing an order.
 
+    Accepts any of the identifiers S&S uses — you don't need to know which
+    is which:
+      • Manufacturer style number (e.g. '8667' Alleson, '3001' Bella+Canvas)
+      • S&S partNumber / Item # (e.g. '17585', '00606')
+      • Alphanumeric style codes (e.g. '567P', 'PC61')
+
+    Pass `brand` when the style number is short (3-4 digits) or you know the
+    brand — this is the fastest, most reliable path. Without a brand hint,
+    the server resolves via a cached catalog scan (1s cold, instant warm).
+
     Args:
-        style: Style number (e.g. '8668', '3001', '00760')
-        color: Optional color filter (e.g. 'Black', 'White')
-        size: Optional size filter (e.g. 'M', 'XL', '2XL')
+        style: Style number, part number, or alphanumeric code.
+        color: Optional color filter (e.g. 'Black', 'White'). Substring match.
+        size: Optional size filter (e.g. 'M', 'XL', '2XL'). Exact match.
+        brand: Optional brand hint (e.g. 'Alleson Athletic', 'Bella+Canvas').
+               Strongly recommended for short numeric styles to avoid
+               cross-brand collisions.
     """
     try:
-        from src.ssactivewear.client import SSClient
+        from src.ssactivewear.client import SSClient, SSActivewearAPIError
 
         client = SSClient()
-        products = await client.get_products(style, color, size)
+        try:
+            products = await client.get_products(style, color, size, brand=brand)
+        except SSActivewearAPIError as e:
+            # Ambiguous style across brands — surface the disambiguation message
+            return f"**Style '{style}' needs a brand hint.** {e}"
 
         if not products:
-            return f"No pricing data returned from S&S for style {style}."
+            hint = f" (brand='{brand}')" if brand else ""
+            return (
+                f"No pricing data returned from S&S for style '{style}'{hint}. "
+                f"Check the style number, or try passing brand='<BrandName>' "
+                f"to disambiguate short style codes."
+            )
 
         # Group by color for a clean pricing table
         color_groups: dict[str, list] = {}

@@ -31,6 +31,13 @@ CDN_BASE = "https://cdn.ssactivewear.com/"
 MAX_REQUESTS_PER_MINUTE = 55
 MIN_REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE  # ~1.09s
 
+# In-memory catalog cache — S&S /styles/ returns the full catalog (~5700 rows,
+# ~6MB) in about 1s. We cache it so repeat lookups by styleName are instant.
+# Refreshed every 15 minutes to pick up new styles.
+_CATALOG_TTL_SEC = 900
+_catalog_cache: dict[str, Any] = {"fetched_at": 0.0, "data": []}
+_catalog_lock = asyncio.Lock()
+
 
 class SSActivewearAPIError(Exception):
     """Raised when S&S Activewear API returns an error."""
@@ -115,85 +122,277 @@ class SSClient:
 
     # ─── Product Methods ───────────────────────────────────────
 
+    async def _get_catalog(self) -> list[dict]:
+        """Fetch the full S&S style catalog, cached in-memory for 15 min.
+
+        S&S's /styles/ endpoint (no path arg) returns the full style catalog
+        in one call — ~5,700 rows, ~6MB JSON, ~1s latency. It's the only
+        reliable way to resolve a manufacturer styleName (e.g. '8667', '3001',
+        '567P') to its internal styleID when the caller can't provide a brand.
+
+        Strategy: fetch once per 15-minute window, hold in memory, serve all
+        styleName lookups from the cached list. Cache is shared across all
+        SSClient instances via a module-level dict.
+
+        Returns:
+            List of style dicts (may be empty on API failure).
+        """
+        async with _catalog_lock:
+            now = time.monotonic()
+            age = now - _catalog_cache["fetched_at"]
+            if _catalog_cache["data"] and age < _CATALOG_TTL_SEC:
+                logger.debug(f"S&S catalog cache hit (age={age:.0f}s, {len(_catalog_cache['data'])} styles)")
+                return _catalog_cache["data"]
+
+            logger.info("S&S catalog cache miss — fetching full /styles/ list")
+            try:
+                data = await self._get("/styles/")
+            except Exception as e:
+                logger.warning(f"Failed to refresh S&S catalog: {e}")
+                # On failure, return whatever we have (even if stale/empty)
+                return _catalog_cache["data"]
+
+            if not isinstance(data, list):
+                data = [data] if data else []
+
+            _catalog_cache["data"] = data
+            _catalog_cache["fetched_at"] = now
+            logger.info(f"S&S catalog cached: {len(data)} styles")
+            return data
+
+    async def resolve_style_id(
+        self,
+        style: str,
+        brand: str = "",
+    ) -> dict | None:
+        """Resolve a user-supplied style identifier to a specific S&S style record.
+
+        Handles the core S&S lookup trap: the /products/ endpoint's ?style=
+        parameter matches against styleID (numeric internal ID) and partNumber,
+        NOT styleName. So raw manufacturer style numbers like '8667' either
+        404 (no such styleID) or return the WRONG product (e.g. '8967' →
+        DRI DUCK 7355 because styleID=8967 belongs to that unrelated product).
+
+        Resolution order (fastest → slowest):
+        1. If `brand` is given → hit /styles/{Brand} {styleName} (single API call,
+           returns exact match).
+        2. Otherwise → scan the cached /styles/ catalog for an exact styleName
+           match. If 1 hit → return it. If multiple hits across brands →
+           return the list as a dict with ambiguity marker.
+
+        Args:
+            style: Manufacturer style number (e.g. '8667', '3001', '567P') OR
+                   S&S partNumber (e.g. '17585', '00606').
+            brand: Optional brand name to disambiguate (e.g. 'Alleson Athletic',
+                   'Bella+Canvas'). Strongly recommended when the style number
+                   could collide across brands.
+
+        Returns:
+            - Single matching style dict (has styleID, styleName, partNumber,
+              brandName, title) on unique match.
+            - Dict with key 'ambiguous' and 'matches' list if multiple brands
+              use the same styleName.
+            - None if no match found.
+        """
+        if not style:
+            return None
+
+        style_norm = style.strip().upper()
+
+        # Strategy 1: brand + style path lookup — most precise, single API call
+        if brand:
+            brand_clean = brand.strip()
+            # Try exact 'Brand StyleName' first — S&S accepts spaces in path
+            path = f"/styles/{brand_clean} {style.strip()}"
+            try:
+                data = await self._get(path)
+            except Exception as e:
+                logger.warning(f"Brand+style path lookup failed: {e}")
+                data = None
+
+            if data:
+                matches = data if isinstance(data, list) else [data]
+                # Filter to exact styleName match (defensive)
+                exact = [
+                    m for m in matches
+                    if str(m.get("styleName", "")).upper() == style_norm
+                ]
+                if exact:
+                    logger.info(
+                        f"Resolved '{brand} {style}' via brand+style path → "
+                        f"styleID={exact[0].get('styleID')}, "
+                        f"partNumber={exact[0].get('partNumber')}"
+                    )
+                    return exact[0]
+
+        # Strategy 2: catalog scan by styleName (works without brand hint)
+        catalog = await self._get_catalog()
+        if catalog:
+            name_hits = [
+                s for s in catalog
+                if str(s.get("styleName", "")).upper() == style_norm
+            ]
+
+            # Narrow by brand if supplied and we found multiple hits
+            if name_hits and brand:
+                brand_lower = brand.strip().lower()
+                brand_filtered = [
+                    s for s in name_hits
+                    if brand_lower in str(s.get("brandName", "")).lower()
+                    or str(s.get("brandName", "")).lower() in brand_lower
+                ]
+                if brand_filtered:
+                    name_hits = brand_filtered
+
+            if len(name_hits) == 1:
+                hit = name_hits[0]
+                logger.info(
+                    f"Resolved styleName '{style}' via catalog → "
+                    f"styleID={hit.get('styleID')}, "
+                    f"partNumber={hit.get('partNumber')}, "
+                    f"brand={hit.get('brandName')}"
+                )
+                return hit
+
+            if len(name_hits) > 1:
+                logger.info(
+                    f"Ambiguous styleName '{style}' — {len(name_hits)} brands match"
+                )
+                return {"ambiguous": True, "matches": name_hits}
+
+            # Strategy 2b: maybe it's a partNumber not a styleName
+            part_hits = [
+                s for s in catalog
+                if str(s.get("partNumber", "")).upper() == style_norm
+            ]
+            if len(part_hits) == 1:
+                hit = part_hits[0]
+                logger.info(
+                    f"Resolved partNumber '{style}' via catalog → "
+                    f"styleID={hit.get('styleID')}, brand={hit.get('brandName')}"
+                )
+                return hit
+
+        # Strategy 3: last-resort direct /styles/{X} lookup (only matches
+        # numeric styleID — kept for partNumber-like inputs as a fallback)
+        try:
+            data = await self._get(f"/styles/{style}")
+        except Exception:
+            data = None
+        if data:
+            match = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+            if match:
+                logger.info(
+                    f"Resolved '{style}' via direct /styles/ path → "
+                    f"styleID={match.get('styleID')}, brand={match.get('brandName')}"
+                )
+                return match
+
+        return None
+
     async def get_products(
         self,
         style: str,
         color: str = "",
         size: str = "",
+        brand: str = "",
     ) -> list[dict]:
         """Get all product SKUs for a style, with pricing and inventory.
 
-        S&S uses two identifiers: partNumber (S&S internal, e.g. '00760')
-        and styleName (manufacturer's, e.g. '2000', '8668', '3001').
-        The ?style= param accepts partNumber, StyleID, or BrandName+Name.
-        We try ?style= first, then fall back to finding the partNumber
-        via the styles endpoint if no results are returned.
+        S&S uses three identifiers, and ONLY styleID is reliable for /products/:
+          • styleID    — numeric internal (e.g. 4560 = Alleson 8667)
+          • partNumber — S&S SKU prefix (e.g. '17585', '00606')
+          • styleName  — manufacturer's number (e.g. '8667', '3001', '567P')
+
+        The ?style= query param matches against styleID and partNumber but
+        NOT styleName. So a raw '8667' either 404s (no such styleID) or
+        returns a completely different product (e.g. '8967' collides with
+        DRI DUCK's styleID=8967).
+
+        Correct approach: resolve styleName → styleID first via
+        `resolve_style_id`, then call ?styleId={N}.
 
         Args:
-            style: Style number or part number (e.g. '8668', '00760', 'Gildan 5000')
-            color: Optional color name to filter results client-side
-            size: Optional size name to filter results client-side
+            style: Style number, part number, or styleID. Accepts anything the
+                   user might paste — we'll figure it out.
+            color: Optional color name filter (client-side substring).
+            size: Optional size name filter (client-side exact).
+            brand: Optional brand hint — strongly recommended when the style
+                   number could collide across brands (e.g. any 4-digit number).
 
         Returns:
             List of product dicts (one per SKU/color/size combo), each with
-            embedded warehouses[] for inventory.
+            embedded warehouses[] for inventory. Returns empty list if the
+            style can't be resolved or returns no SKUs.
+
+        Raises:
+            SSActivewearAPIError: if the styleName is ambiguous across brands
+                and no brand hint was supplied. The error message lists the
+                matching brands so the caller can disambiguate.
         """
-        # S&S products endpoint accepts two key params:
-        #   ?style=  → matches partNumber (S&S internal, e.g. '00760')
-        #   ?styleId= → matches numeric styleID (e.g. 9182)
-        # Users typically provide manufacturer style names (e.g. '3001', '8668').
-        # Strategy: try ?style= first, then look up styleID via /styles/ and retry.
+        # Step 1 — resolve to a canonical style record
+        resolved = await self.resolve_style_id(style, brand=brand)
 
-        # Try direct ?style= query (works with partNumber)
-        data = await self._get("/products/", params={"style": style})
+        if not resolved:
+            # Last-ditch: maybe the raw ?style= still works (e.g. a true
+            # partNumber that isn't in the catalog yet)
+            logger.info(f"No catalog match for '{style}', trying direct ?style=")
+            raw = await self._get("/products/", params={"style": style})
+            if raw:
+                data = raw if isinstance(raw, list) else [raw]
+                return self._apply_sku_filters(data, color, size)
+            return []
 
-        # If no results, look up the styleID via the styles endpoint
+        # Handle ambiguity — bubble up a useful error
+        if resolved.get("ambiguous"):
+            matches = resolved["matches"]
+            brand_list = ", ".join(
+                f"{m.get('brandName', '?')} ({m.get('title', '?')})"
+                for m in matches[:5]
+            )
+            raise SSActivewearAPIError(
+                f"Style '{style}' exists in {len(matches)} brands: {brand_list}. "
+                f"Pass brand='<BrandName>' to disambiguate."
+            )
+
+        # Step 2 — fetch all SKUs via styleID (the only 100%-reliable method)
+        style_id = resolved.get("styleID")
+        if not style_id:
+            return []
+
+        data = await self._get("/products/", params={"styleId": style_id})
+
         if not data:
-            logger.info(f"S&S products ?style={style} returned nothing, trying styles lookup")
-            style_info = await self._get(f"/styles/{style}")
-            if style_info:
-                # styles endpoint may return a list or single dict
-                if isinstance(style_info, list):
-                    # Find exact styleName match if possible
-                    match = None
-                    for s in style_info:
-                        if s.get("styleName", "").upper() == style.upper():
-                            match = s
-                            break
-                    if not match:
-                        match = style_info[0]
-                else:
-                    match = style_info
-
-                # Try styleId param (numeric ID) — this is what works in vendo-server
-                style_id = match.get("styleID")
-                if style_id:
-                    logger.info(f"Found styleID {style_id} for '{style}', re-querying products")
-                    data = await self._get("/products/", params={"styleId": style_id})
-
-                # If still nothing, try partNumber
-                if not data:
-                    part_number = match.get("partNumber", "")
-                    if part_number and part_number != style:
-                        logger.info(f"Trying partNumber '{part_number}' for '{style}'")
-                        data = await self._get("/products/", params={"style": part_number})
+            # Odd case: catalog has the style but /products/ returned nothing.
+            # Try partNumber as a secondary path.
+            part_number = resolved.get("partNumber", "")
+            if part_number:
+                logger.info(f"styleId={style_id} returned 0 products, trying partNumber={part_number}")
+                data = await self._get("/products/", params={"style": part_number})
 
         if not data:
             return []
 
-        # Response is a flat JSON array of product objects
         if not isinstance(data, list):
             data = [data]
 
-        # Client-side filtering (S&S doesn't support color/size query params)
+        return self._apply_sku_filters(data, color, size)
+
+    @staticmethod
+    def _apply_sku_filters(data: list[dict], color: str, size: str) -> list[dict]:
+        """Apply client-side color/size filters to a product list.
+
+        S&S's /products/ endpoint does not support color or size filters,
+        so we filter locally. Color match is substring (case-insensitive),
+        size match is exact (case-insensitive).
+        """
         if color:
             color_lower = color.lower()
-            data = [p for p in data if color_lower in p.get("colorName", "").lower()]
+            data = [p for p in data if color_lower in (p.get("colorName", "") or "").lower()]
         if size:
             size_upper = size.upper()
-            data = [p for p in data if p.get("sizeName", "").upper() == size_upper]
-
-        logger.info(f"S&S get_products({style}): {len(data)} SKUs returned")
+            data = [p for p in data if (p.get("sizeName", "") or "").upper() == size_upper]
+        logger.info(f"S&S get_products: {len(data)} SKUs after filtering (color={color!r}, size={size!r})")
         return data
 
     async def get_products_by_style_id(self, style_id: int) -> list[dict]:
@@ -243,77 +442,76 @@ class SSClient:
     ) -> list[dict]:
         """Search S&S catalog by keyword, brand, or style identifier.
 
-        The official /styles/search= endpoint is unreliable (often returns
-        empty results).  This method implements a multi-strategy fallback
-        matching the approach used in vendo-server:
-
-        1. Try /styles/search={query}  (official search — works sometimes)
-        2. Try /styles/{query}         (direct lookup by styleName, partNumber, or BrandName+Name)
-        3. If a brand filter was given, fetch /brands to resolve the brand ID
-           then filter /styles by matching brandName
-        4. Try /styles/{brand}         (path-segment brand lookup)
+        The official /styles/search= endpoint is effectively non-functional —
+        it returns an empty list for nearly every query we've tested. Instead,
+        we search the cached full-catalog list (/styles/) client-side, which
+        is fast (instant after first warm), reliable, and supports rich
+        filtering without hammering the S&S API.
 
         Args:
             query: Keyword / style number / part number (e.g. '3001', 'track singlet')
             brand: Brand name filter (e.g. 'Alleson Athletic', 'Bella+Canvas')
 
         Returns:
-            List of style dicts matching the query.
+            List of style dicts matching the filters.
         """
-        search_term = query or brand
-        if not search_term:
+        if not (query or brand):
             return []
 
-        results: list[dict] = []
+        catalog = await self._get_catalog()
+        if not catalog:
+            return []
 
-        # Strategy 1: Official search= endpoint (sometimes works)
-        logger.info(f"S&S search_styles: trying /styles/search={search_term}")
-        data = await self._get(f"/styles/search={search_term}")
-        if data:
-            results = data if isinstance(data, list) else [data]
+        query_lower = query.strip().lower() if query else ""
+        query_upper = query.strip().upper() if query else ""
+        brand_lower = brand.strip().lower() if brand else ""
 
-        # Strategy 2: Direct path lookup (works for styleName, partNumber,
-        # styleID, and 'BrandName StyleName' combos)
-        if not results:
-            logger.info(f"S&S search_styles: trying /styles/{search_term}")
-            data = await self._get(f"/styles/{search_term}")
-            if data:
-                results = data if isinstance(data, list) else [data]
+        def _matches(s: dict) -> bool:
+            # Brand filter is strict: must match brandName (substring,
+            # case-insensitive, bidirectional to handle 'Bella' vs 'Bella+Canvas').
+            if brand_lower:
+                bn = str(s.get("brandName", "")).lower()
+                if brand_lower not in bn and bn not in brand_lower:
+                    return False
 
-        # Strategy 3: Brand-based search — look up brand, then fetch
-        # all styles for that brand by name.  We fetch the brands list
-        # and then query /styles/ with the brand path segment.
-        brand_filter = brand.lower() if brand else ""
-        if not results and brand_filter:
-            logger.info(f"S&S search_styles: trying brand lookup for '{brand}'")
-            brands = await self.get_brands()
-            matching_brands = [
-                b for b in brands
-                if brand_filter in b.get("name", "").lower()
-            ]
-            if matching_brands:
-                # Use BrandName path — e.g. /styles/Alleson Athletic
-                for b in matching_brands[:3]:  # cap at 3 brands
-                    brand_name = b.get("name", "")
-                    if brand_name:
-                        logger.info(f"S&S search_styles: fetching /styles/{brand_name}")
-                        data = await self._get(f"/styles/{brand_name}")
-                        if data:
-                            batch = data if isinstance(data, list) else [data]
-                            results.extend(batch)
+            # Query filter matches styleName/partNumber/title/description/category.
+            if query_lower:
+                # Exact styleName/partNumber is the strongest signal
+                if str(s.get("styleName", "")).upper() == query_upper:
+                    return True
+                if str(s.get("partNumber", "")).upper() == query_upper:
+                    return True
+                # Fall back to substring match across text fields
+                haystack = " ".join([
+                    str(s.get("styleName", "")),
+                    str(s.get("title", "")),
+                    str(s.get("description") or ""),
+                    str(s.get("baseCategory", "")),
+                ]).lower()
+                if query_lower not in haystack:
+                    return False
 
-        # If we have brand results AND a keyword query, filter client-side
-        if results and query and brand:
-            query_lower = query.lower()
-            results = [
-                s for s in results
-                if query_lower in s.get("styleName", "").lower()
-                or query_lower in s.get("title", "").lower()
-                or query_lower in (s.get("description") or "").lower()
-                or query_lower in s.get("baseCategory", "").lower()
-            ]
+            return True
 
-        logger.info(f"S&S search_styles(query={query!r}, brand={brand!r}): {len(results)} styles found")
+        results = [s for s in catalog if _matches(s)]
+
+        # Stable ordering: exact styleName matches first, then title matches,
+        # then everything else — makes the first result the most relevant.
+        def _score(s: dict) -> int:
+            if not query_upper:
+                return 2
+            if str(s.get("styleName", "")).upper() == query_upper:
+                return 0
+            if str(s.get("partNumber", "")).upper() == query_upper:
+                return 1
+            return 2
+
+        results.sort(key=_score)
+
+        logger.info(
+            f"S&S search_styles(query={query!r}, brand={brand!r}): "
+            f"{len(results)} styles found in catalog of {len(catalog)}"
+        )
         return results
 
     async def get_brands(self) -> list[dict]:
