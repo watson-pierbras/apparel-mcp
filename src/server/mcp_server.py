@@ -6,6 +6,9 @@ import logging
 from typing import Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.exceptions import ToolError
 from dotenv import load_dotenv
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -210,12 +213,85 @@ mcp = FastMCP(
 
 
 # ─────────────────────────────────────────────────────────────
+# Bearer-token authentication middleware
+# Protects every tool call when MCP_API_KEY is set in the env.
+# When unset (local dev / Claude Desktop stdio), auth is skipped.
+# ─────────────────────────────────────────────────────────────
+
+class BearerAuthMiddleware(Middleware):
+    """Validate `Authorization: Bearer <MCP_API_KEY>` on every tool call."""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        # get_http_headers can miss the Authorization header because FastMCP
+        # strips "sensitive" headers by default. Pass include_all=True to
+        # receive Authorization / x-api-key.
+        try:
+            headers = get_http_headers(include_all=True) or {}
+        except TypeError:
+            # Older FastMCP versions don't support include_all kwarg.
+            headers = get_http_headers() or {}
+
+        # Normalize to lowercase keys — ASGI headers are case-insensitive.
+        headers = {k.lower(): v for k, v in headers.items()}
+
+        auth_header = headers.get("authorization", "")
+        x_api_key = headers.get("x-api-key", "")
+
+        # Log header names only (never values) to debug auth issues
+        # without leaking secrets.
+        if not auth_header and not x_api_key:
+            logger.warning(
+                "Tool call received with no auth header. Headers seen: %s",
+                sorted(headers.keys()),
+            )
+
+        token = None
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        elif x_api_key:
+            token = x_api_key.strip()
+        elif auth_header:
+            token = auth_header.strip()
+
+        if token != self.api_key:
+            raise ToolError("Unauthorized: invalid or missing API key.")
+
+        return await call_next(context)
+
+
+_MCP_API_KEY = os.getenv("MCP_API_KEY", "").strip()
+if _MCP_API_KEY:
+    mcp.add_middleware(BearerAuthMiddleware(_MCP_API_KEY))
+    logger.info("Bearer auth enabled for tool calls.")
+else:
+    logger.warning(
+        "MCP_API_KEY not set — server is running WITHOUT authentication. "
+        "Do not expose this server publicly in this state."
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Well-known endpoints so MCP clients skip OAuth discovery
 # ─────────────────────────────────────────────────────────────
 
+@mcp.custom_route("/", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Root health check — used by Railway and uptime monitors."""
+    return JSONResponse({
+        "name": "apparel-mcp",
+        "status": "ok",
+        "transport": "streamable-http",
+        "endpoint": "/mcp",
+        "auth": "bearer" if os.getenv("MCP_API_KEY") else "none",
+    })
+
+
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def oauth_protected_resource(request: Request) -> JSONResponse:
-    """Tell MCP clients this server requires no authentication."""
+    """Tell MCP clients this server requires no OAuth (we use a simple bearer)."""
     return JSONResponse({"resource": request.url.scheme + "://" + request.url.netloc + "/mcp"})
 
 
@@ -1118,6 +1194,11 @@ async def search_ss_live(
     Use this to browse S&S products live — find Alleson, Bella+Canvas,
     Next Level, Gildan, and other styles before adding them to tracking.
 
+    Passing `brand` together with `style` is strongly recommended when the
+    style number could exist in multiple brands (any short numeric like
+    '3001', '8667', '5000'). Without a brand hint, S&S's API can return the
+    wrong product because short style numbers collide with internal styleIDs.
+
     You must provide at least one of: style, brand, or query.
 
     Args:
@@ -1129,17 +1210,27 @@ async def search_ss_live(
         return "Please provide at least one of: style, brand, or query."
 
     try:
-        from src.ssactivewear.client import SSClient
+        from src.ssactivewear.client import SSClient, SSActivewearAPIError
         from src.ssactivewear.mapper import map_products_response
 
         client = SSClient()
 
         if style:
-            # Direct product lookup by style — most specific
-            raw_products = await client.get_products(style)
+            # Direct product lookup by style — most specific.
+            # Pass `brand` through so we resolve via catalog instead of the
+            # broken ?style= param that collides on styleID.
+            try:
+                raw_products = await client.get_products(style, brand=brand)
+            except SSActivewearAPIError as e:
+                return f"S&S search error: {e}"
 
             if not raw_products:
-                return f"No products found for S&S style '{style}'."
+                hint = f" in brand '{brand}'" if brand else ""
+                return (
+                    f"No products found for S&S style '{style}'{hint}. "
+                    f"If this is a valid style number, try passing a brand hint "
+                    f"(e.g. brand='Alleson Athletic')."
+                )
 
             # Group SKUs by style name
             styles_seen: dict[str, dict] = {}
@@ -1247,6 +1338,7 @@ async def get_ss_live_pricing(
     style: str,
     color: str = "",
     size: str = "",
+    brand: str = "",
 ) -> str:
     """Get REAL-TIME pricing for a style directly from S&S Activewear's API.
 
@@ -1254,19 +1346,41 @@ async def get_ss_live_pricing(
     need guaranteed-current pricing, such as before quoting a customer
     or placing an order.
 
+    Accepts any of the identifiers S&S uses — you don't need to know which
+    is which:
+      • Manufacturer style number (e.g. '8667' Alleson, '3001' Bella+Canvas)
+      • S&S partNumber / Item # (e.g. '17585', '00606')
+      • Alphanumeric style codes (e.g. '567P', 'PC61')
+
+    Pass `brand` when the style number is short (3-4 digits) or you know the
+    brand — this is the fastest, most reliable path. Without a brand hint,
+    the server resolves via a cached catalog scan (1s cold, instant warm).
+
     Args:
-        style: Style number (e.g. '8668', '3001', '00760')
-        color: Optional color filter (e.g. 'Black', 'White')
-        size: Optional size filter (e.g. 'M', 'XL', '2XL')
+        style: Style number, part number, or alphanumeric code.
+        color: Optional color filter (e.g. 'Black', 'White'). Substring match.
+        size: Optional size filter (e.g. 'M', 'XL', '2XL'). Exact match.
+        brand: Optional brand hint (e.g. 'Alleson Athletic', 'Bella+Canvas').
+               Strongly recommended for short numeric styles to avoid
+               cross-brand collisions.
     """
     try:
-        from src.ssactivewear.client import SSClient
+        from src.ssactivewear.client import SSClient, SSActivewearAPIError
 
         client = SSClient()
-        products = await client.get_products(style, color, size)
+        try:
+            products = await client.get_products(style, color, size, brand=brand)
+        except SSActivewearAPIError as e:
+            # Ambiguous style across brands — surface the disambiguation message
+            return f"**Style '{style}' needs a brand hint.** {e}"
 
         if not products:
-            return f"No pricing data returned from S&S for style {style}."
+            hint = f" (brand='{brand}')" if brand else ""
+            return (
+                f"No pricing data returned from S&S for style '{style}'{hint}. "
+                f"Check the style number, or try passing brand='<BrandName>' "
+                f"to disambiguate short style codes."
+            )
 
         # Group by color for a clean pricing table
         color_groups: dict[str, list] = {}
@@ -1354,11 +1468,14 @@ def main():
         default="127.0.0.1",
         help="Host to bind when using streamable-http (default: 127.0.0.1)",
     )
+    # Default to $PORT (Railway / Heroku / Fly all inject this) or 8000 locally.
+    # Read from env first so `--port` is optional in container deploys.
+    default_port = int(os.getenv("PORT", "8000"))
     parser.add_argument(
         "--port",
         type=int,
-        default=8000,
-        help="Port to bind when using streamable-http (default: 8000)",
+        default=default_port,
+        help=f"Port to bind when using streamable-http (default: {default_port})",
     )
     args = parser.parse_args()
 
