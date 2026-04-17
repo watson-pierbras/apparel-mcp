@@ -225,10 +225,28 @@ class BearerAuthMiddleware(Middleware):
         self.api_key = api_key
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        headers = get_http_headers() or {}
-        # Accept either Authorization: Bearer <key> or x-api-key: <key>
+        # get_http_headers can miss the Authorization header because FastMCP
+        # strips "sensitive" headers by default. Pass include_all=True to
+        # receive Authorization / x-api-key.
+        try:
+            headers = get_http_headers(include_all=True) or {}
+        except TypeError:
+            # Older FastMCP versions don't support include_all kwarg.
+            headers = get_http_headers() or {}
+
+        # Normalize to lowercase keys — ASGI headers are case-insensitive.
+        headers = {k.lower(): v for k, v in headers.items()}
+
         auth_header = headers.get("authorization", "")
         x_api_key = headers.get("x-api-key", "")
+
+        # Log header names only (never values) to debug auth issues
+        # without leaking secrets.
+        if not auth_header and not x_api_key:
+            logger.warning(
+                "Tool call received with no auth header. Headers seen: %s",
+                sorted(headers.keys()),
+            )
 
         token = None
         if auth_header.lower().startswith("bearer "):
